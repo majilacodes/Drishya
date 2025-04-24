@@ -4,14 +4,16 @@ import numpy as np
 import cv2
 import os
 import tempfile
-import requests
-from tqdm import tqdm
 from PIL import Image
 from segment_anything import sam_model_registry, SamPredictor
 import matplotlib.pyplot as plt
 from streamlit_drawable_canvas import st_canvas
 import base64
 from io import BytesIO
+
+# Suppress the torch.classes warning
+import warnings
+warnings.filterwarnings("ignore", message="Examining the path of torch.classes")
 
 # Set page configuration to wide layout
 st.set_page_config(
@@ -474,78 +476,44 @@ def replace_product_in_image(ad_image, new_product, mask, scale_factor=1.0, feat
     
     return output
 
-def download_file(url, dest):
-    """
-    Download a file from url to destination with progress bar
-    """
-    response = requests.get(url, stream=True)
-    total_size_in_bytes = int(response.headers.get('content-length', 0))
-    progress_bar = st.progress(0)
-    progress_text = st.empty()
-    
-    if total_size_in_bytes == 0:
-        progress_text.text(f"Downloading model file... (unknown size)")
-    else:
-        progress_text.text(f"Downloading model file... (0/{total_size_in_bytes/1024/1024:.1f} MB)")
-    
-    downloaded = 0
-    with open(dest, 'wb') as file:
-        for data in response.iter_content(chunk_size=4096):
-            file.write(data)
-            downloaded += len(data)
-            if total_size_in_bytes > 0:
-                progress = int(100 * downloaded / total_size_in_bytes)
-                progress_bar.progress(progress/100)
-                progress_text.text(f"Downloading model file... ({downloaded/1024/1024:.1f}/{total_size_in_bytes/1024/1024:.1f} MB)")
-            else:
-                progress_text.text(f"Downloading model file... ({downloaded/1024/1024:.1f} MB)")
-    
-    progress_bar.progress(100/100)
-    progress_text.text(f"Download complete! ({downloaded/1024/1024:.1f} MB)")
-    return dest
-
 @st.cache_resource
 def load_model():
-    """Download and load the SAM model"""
+    """Load the SAM model from a local file"""
     # Check if CUDA is available
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     
-    # Model info
+    # Path to the model file - look in current directory first, then try common locations
     model_filename = "sam_vit_b_01ec64.pth"
-    model_type = "vit_b"
+    possible_paths = [
+        model_filename,  # Current directory
+        os.path.join("models", model_filename),  # models subdirectory
+        os.path.join(os.path.dirname(__file__), model_filename),  # Same directory as script
+        os.path.join(os.path.dirname(__file__), "models", model_filename)  # models subdirectory relative to script
+    ]
     
-    # Create cache directory if it doesn't exist
-    cache_dir = os.path.join(tempfile.gettempdir(), "sam_model_cache")
-    os.makedirs(cache_dir, exist_ok=True)
+    # Try to find the model file
+    checkpoint_path = None
+    for path in possible_paths:
+        if os.path.isfile(path):
+            checkpoint_path = path
+            break
     
-    # Path to the cached model file
-    model_path = os.path.join(cache_dir, model_filename)
-    
-    # Check if model already exists in cache
-    if not os.path.isfile(model_path):
-        st.info("Model not found in cache. Downloading now...")
-        
-        # Model URL (Meta's official release)
-        model_url = "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth"
-        
-        # Download the model with progress bar
-        try:
-            download_file(model_url, model_path)
-        except Exception as e:
-            st.error(f"Error downloading model: {e}")
-            # Add file uploader as fallback
-            uploaded_model = st.file_uploader("Upload SAM model file (sam_vit_b_01ec64.pth)", type=["pth"])
-            if uploaded_model is not None:
-                # Save the uploaded model
-                with open(model_path, 'wb') as f:
-                    f.write(uploaded_model.getvalue())
-            else:
-                st.stop()
-    else:
-        st.success("Model loaded from cache")
+    # If model file not found, show error
+    if checkpoint_path is None:
+        st.error(f"Model file '{model_filename}' not found. Please upload the SAM model file.")
+        # Add file uploader for model
+        uploaded_model = st.file_uploader("Upload SAM model file (sam_vit_b_01ec64.pth)", type=["pth"])
+        if uploaded_model is not None:
+            # Save the uploaded model to a temporary file
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.pth') as tmp_file:
+                tmp_file.write(uploaded_model.getvalue())
+                checkpoint_path = tmp_file.name
+        else:
+            st.stop()
     
     # Load the model
-    sam = sam_model_registry[model_type](checkpoint=model_path).to(device=device)
+    model_type = "vit_b"
+    sam = sam_model_registry[model_type](checkpoint=checkpoint_path).to(device=device)
     mask_predictor = SamPredictor(sam)
     
     return mask_predictor, device
@@ -664,7 +632,7 @@ if uploaded_ad_file is not None:
                         st.session_state.processing_step = 3  # Advance to next step
                         
                         # Force re-run to update the UI
-                        st.experimental_rerun()
+                        st.rerun()
 
     # Step 3: Show mask and allow product upload
     if st.session_state.mask_displayed and st.session_state.generated_mask is not None:
