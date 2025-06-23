@@ -3,18 +3,109 @@ import torch
 import numpy as np
 import cv2
 import os
-import tempfile
 import requests
 from PIL import Image
 from segment_anything import sam_model_registry, SamPredictor
-import matplotlib.pyplot as plt
 from streamlit_drawable_canvas import st_canvas
-import base64
 from io import BytesIO
 
 # Suppress the torch.classes warning
 import warnings
 warnings.filterwarnings("ignore", message="Examining the path of torch.classes")
+
+@st.cache_resource
+def load_model():
+    """Load the SAM model by downloading weights automatically"""
+    # Check if CUDA is available
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
+    # Model configuration
+    model_type = "vit_b"
+    model_filename = "sam_vit_b_01ec64.pth"
+    model_url = "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth"
+
+    # Use a persistent directory for model storage
+    # This ensures the model is only downloaded once and persists across sessions
+    home_dir = os.path.expanduser("~")
+    model_dir = os.path.join(home_dir, ".cache", "drishya", "models")
+    os.makedirs(model_dir, exist_ok=True)
+    checkpoint_path = os.path.join(model_dir, model_filename)
+
+    # Download the model if it doesn't exist
+    if not os.path.exists(checkpoint_path):
+        # Create a placeholder for progress tracking
+        progress_placeholder = st.empty()
+        status_placeholder = st.empty()
+
+        with progress_placeholder.container():
+            st.info("🔄 Downloading SAM model weights... This may take 2-3 minutes on first run.")
+            progress_bar = st.progress(0)
+
+        with status_placeholder.container():
+            status_text = st.empty()
+
+        try:
+            # Download with progress bar
+            response = requests.get(model_url, stream=True, timeout=60)
+            response.raise_for_status()
+
+            total_size = int(response.headers.get('content-length', 0))
+
+            downloaded = 0
+            # Use a temporary file first, then move to final location to avoid partial downloads
+            temp_path = checkpoint_path + ".tmp"
+
+            try:
+                with open(temp_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                            downloaded += len(chunk)
+
+                            # Update progress
+                            if total_size > 0:
+                                progress = downloaded / total_size
+                                progress_bar.progress(progress)
+                                status_text.text(f"Downloaded {downloaded / (1024*1024):.1f} MB / {total_size / (1024*1024):.1f} MB")
+
+                # Move temp file to final location only if download completed successfully
+                os.rename(temp_path, checkpoint_path)
+
+                progress_bar.progress(1.0)
+                status_text.text("Download complete! Loading model...")
+
+            except Exception as e:
+                # Clean up temp file if download failed
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+                raise e
+
+        except requests.exceptions.RequestException as e:
+            st.error(f"Failed to download model: {str(e)}")
+            st.error("Please check your internet connection and try again.")
+            st.stop()
+        except Exception as e:
+            st.error(f"Error downloading model: {str(e)}")
+            st.stop()
+        finally:
+            # Clean up progress indicators after download
+            progress_placeholder.empty()
+            status_placeholder.empty()
+
+    try:
+        # Load the model
+        sam = sam_model_registry[model_type](checkpoint=checkpoint_path).to(device=device)
+        mask_predictor = SamPredictor(sam)
+
+        return mask_predictor, device
+
+    except Exception as e:
+        st.error(f"Failed to load model: {str(e)}")
+        st.error("The downloaded model file may be corrupted. Please refresh the page to try again.")
+        # Clean up corrupted file
+        if os.path.exists(checkpoint_path):
+            os.remove(checkpoint_path)
+        st.stop()
 
 # Set page configuration to wide layout
 st.set_page_config(
@@ -60,6 +151,21 @@ def check_password():
 
 if not check_password():
     st.stop()  # Stop execution if password is incorrect
+
+# Initialize session state for model management
+if 'model_loaded' not in st.session_state:
+    st.session_state.model_loaded = False
+if 'mask_predictor' not in st.session_state:
+    st.session_state.mask_predictor = None
+if 'device' not in st.session_state:
+    st.session_state.device = None
+
+# Load model immediately after password is correct
+if not st.session_state.model_loaded:
+    with st.spinner("🔄 Loading AI model... This may take 2-3 minutes on first run."):
+        st.session_state.mask_predictor, st.session_state.device = load_model()
+        st.session_state.model_loaded = True
+    st.success("✅ AI model loaded successfully! You can now upload images.")
 
 # Helper functions
 def show_mask(mask, image):
@@ -483,85 +589,17 @@ def replace_product_in_image(ad_image, new_product, mask, scale_factor=1.0, feat
     
     return output
 
-@st.cache_resource
-def load_model():
-    """Load the SAM model by downloading weights automatically"""
-    # Check if CUDA is available
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
-    # Model configuration
-    model_type = "vit_b"
-    model_filename = "sam_vit_b_01ec64.pth"
-    model_url = "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth"
-
-    # Create a temporary directory for the model
-    model_dir = tempfile.mkdtemp()
-    checkpoint_path = os.path.join(model_dir, model_filename)
-
-    # Download the model if it doesn't exist
-    if not os.path.exists(checkpoint_path):
-        st.info("🔄 Downloading SAM model weights... This may take 2-3 minutes on first run.")
-        st.info("💡 The model will be cached for faster subsequent loads.")
-
-        try:
-            # Download with progress bar
-            response = requests.get(model_url, stream=True, timeout=30)
-            response.raise_for_status()
-
-            total_size = int(response.headers.get('content-length', 0))
-
-            # Create progress bar
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-
-            downloaded = 0
-            with open(checkpoint_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-                        downloaded += len(chunk)
-
-                        # Update progress
-                        if total_size > 0:
-                            progress = downloaded / total_size
-                            progress_bar.progress(progress)
-                            status_text.text(f"Downloaded {downloaded / (1024*1024):.1f} MB / {total_size / (1024*1024):.1f} MB")
-
-            progress_bar.progress(1.0)
-            status_text.text("Download complete! Loading model...")
-
-        except requests.exceptions.RequestException as e:
-            st.error(f"Failed to download model: {str(e)}")
-            st.error("Please check your internet connection and try again.")
-            st.stop()
-        except Exception as e:
-            st.error(f"Error downloading model: {str(e)}")
-            st.stop()
-
-    try:
-        # Load the model
-        sam = sam_model_registry[model_type](checkpoint=checkpoint_path).to(device=device)
-        mask_predictor = SamPredictor(sam)
-
-        # Clean up progress indicators
-        if 'progress_bar' in locals():
-            progress_bar.empty()
-        if 'status_text' in locals():
-            status_text.empty()
-
-        return mask_predictor, device
-
-    except Exception as e:
-        st.error(f"Failed to load model: {str(e)}")
-        st.error("The downloaded model file may be corrupted. Please refresh the page to try again.")
-        # Clean up corrupted file
-        if os.path.exists(checkpoint_path):
-            os.remove(checkpoint_path)
-        st.stop()
 
 # Check for health check endpoint
 if st.query_params.get("health") == "check":
-    st.json({"status": "healthy", "service": "drishya", "model": "SAM"})
+    st.json({
+        "status": "healthy",
+        "service": "drishya",
+        "model": "SAM",
+        "version": "1.0.0",
+        "model_loaded": st.session_state.get('model_loaded', False)
+    })
     st.stop()
 
 # App title and description
@@ -575,7 +613,7 @@ st.markdown("""
 3. Upload a new product image
 4. Adjust settings and download the result
 
-*First load may take 2-3 minutes while downloading the AI model.*
+*The AI model loads automatically after login for optimal performance.*
 """)
 
 # Create session state for storing data between reruns
@@ -595,27 +633,34 @@ st.header("Step 1: Upload Image")
 uploaded_ad_file = st.file_uploader("Upload image with product to replace", type=["jpg", "jpeg", "png"], key="ad_image")
 
 if uploaded_ad_file is not None:
-    
-    mask_predictor, device = load_model()
-    
+    # Use the pre-loaded model from session state
+    mask_predictor = st.session_state.mask_predictor
+    device = st.session_state.device
+
     # Read the image
     image = Image.open(uploaded_ad_file)
+
+    # Ensure image is in RGB format for consistent processing
+    if image.mode == 'RGBA':
+        # Convert RGBA to RGB by compositing over white background
+        background = Image.new('RGB', image.size, (255, 255, 255))
+        background.paste(image, mask=image.split()[-1])  # Use alpha channel as mask
+        image = background
+    elif image.mode != 'RGB':
+        image = image.convert('RGB')
+
     image_np = np.array(image)
-    
+
     # Save original image to session state
     st.session_state.original_image = image_np.copy()
-    
-    # Convert image to RGB if it's RGBA
-    if image_np.shape[-1] == 4:  # RGBA
-        image_rgb = cv2.cvtColor(image_np, cv2.COLOR_RGBA2RGB)
-    else:
-        image_rgb = image_np.copy()
+
+    # Use the RGB image directly
+    image_rgb = image_np.copy()
     
     # Step 2: Draw bounding box
     st.header("Step 2: Draw Bounding Box")
     st.markdown("Draw a box around the product you want to replace")
     
-    # Canvas for drawing
     # Set up a reasonable canvas size based on image dimensions
     h, w = image_rgb.shape[:2]
     canvas_width = min(800, w)
@@ -661,7 +706,7 @@ if uploaded_ad_file is not None:
             
             with col2:
                 if st.button("Generate Mask", key="generate_mask"):
-                    with st.spinner("Processing image with AI..."):
+                    with st.spinner("Processing image"):
                         # Set the image for the predictor
                         mask_predictor.set_image(image_rgb)
                         
@@ -709,7 +754,17 @@ if uploaded_ad_file is not None:
         if uploaded_product is not None:
             # Read the new product image
             new_product_img = Image.open(uploaded_product)
-            new_product_np = np.array(new_product_img)
+
+            # Ensure consistent image format handling
+            if new_product_img.mode == 'RGBA':
+                # Keep RGBA for products that have transparency
+                new_product_np = np.array(new_product_img)
+            elif new_product_img.mode != 'RGB':
+                # Convert other formats to RGB
+                new_product_img = new_product_img.convert('RGB')
+                new_product_np = np.array(new_product_img)
+            else:
+                new_product_np = np.array(new_product_img)
             
             # Create a row for the product preview and settings
             col1, col2 = st.columns([1, 2])
@@ -771,14 +826,13 @@ if uploaded_ad_file is not None:
             # Replace button
             if st.button("Replace Product"):
                 with st.spinner("Replacing product..."):
-                    # Ensure the original image is in the correct format
-                    original_img = st.session_state.original_image
-                    if original_img.shape[-1] == 4:  # RGBA
-                        original_img = cv2.cvtColor(original_img, cv2.COLOR_RGBA2RGB)
-                    
+                    # Use the original image (already in RGB format)
+                    original_img = st.session_state.original_image.copy()
+
                     # Ensure new product is in the correct format
                     if len(new_product_np.shape) == 2:  # Grayscale
                         new_product_np = cv2.cvtColor(new_product_np, cv2.COLOR_GRAY2RGB)
+                    # new_product_np is already handled above for RGBA/RGB formats
                     
                     # Apply color grading if enabled
                     graded_product = new_product_np.copy()
@@ -814,27 +868,34 @@ if uploaded_ad_file is not None:
                     # Display the results side by side
                     st.header("Results")
                     col1, col2 = st.columns(2)
-                    
+
                     with col1:
                         st.markdown("**Original Image**")
-                        st.image(original_img, use_column_width=True)
-                    
+                        # Ensure image is in correct format for display
+                        display_original = np.clip(original_img, 0, 255).astype(np.uint8)
+                        st.image(display_original, use_column_width=True)
+
                     with col2:
                         st.markdown("**Replaced Product**")
-                        st.image(result_image, use_column_width=True)
+                        # Ensure result image is in correct format for display
+                        display_result = np.clip(result_image, 0, 255).astype(np.uint8)
+                        st.image(display_result, use_column_width=True)
                     
                     # Save the result to a temporary file for download
-                    result_pil = Image.fromarray(result_image)
-                    result_buf = tempfile.NamedTemporaryFile(delete=False, suffix='.png')
-                    result_pil.save(result_buf.name)
-                    
-                    with open(result_buf.name, 'rb') as f:
-                        st.download_button(
-                            label="Download Final Image",
-                            data=f,
-                            file_name="product_replaced_image.png",
-                            mime="image/png"
-                        )
+                    display_result = np.clip(result_image, 0, 255).astype(np.uint8)
+                    result_pil = Image.fromarray(display_result)
+
+                    # Create a BytesIO buffer for the download
+                    img_buffer = BytesIO()
+                    result_pil.save(img_buffer, format='PNG')
+                    img_buffer.seek(0)
+
+                    st.download_button(
+                        label="Download Final Image",
+                        data=img_buffer.getvalue(),
+                        file_name="product_replaced_image.png",
+                        mime="image/png"
+                    )
 
 # Add footer
 st.markdown("---")
