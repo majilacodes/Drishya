@@ -4,6 +4,7 @@ import numpy as np
 import cv2
 import os
 import tempfile
+import requests
 from PIL import Image
 from segment_anything import sam_model_registry, SamPredictor
 import matplotlib.pyplot as plt
@@ -17,9 +18,15 @@ warnings.filterwarnings("ignore", message="Examining the path of torch.classes")
 
 # Set page configuration to wide layout
 st.set_page_config(
-    page_title="Drishya",
+    page_title="Drishya - AI Product Replacement",
     page_icon="🖼️",
     layout="wide",
+    initial_sidebar_state="collapsed",
+    menu_items={
+        'Get Help': 'https://github.com/your-username/drishya',
+        'Report a bug': 'https://github.com/your-username/drishya/issues',
+        'About': "Drishya - AI-powered product replacement tool using Meta's SAM"
+    }
 )
 
 # Password protection
@@ -478,54 +485,97 @@ def replace_product_in_image(ad_image, new_product, mask, scale_factor=1.0, feat
 
 @st.cache_resource
 def load_model():
-    """Load the SAM model from a local file"""
+    """Load the SAM model by downloading weights automatically"""
     # Check if CUDA is available
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-    
-    # Path to the model file - look in current directory first, then try common locations
-    model_filename = "sam_vit_b_01ec64.pth"
-    possible_paths = [
-        model_filename,  # Current directory
-        os.path.join("models", model_filename),  # models subdirectory
-        os.path.join(os.path.dirname(__file__), model_filename),  # Same directory as script
-        os.path.join(os.path.dirname(__file__), "models", model_filename)  # models subdirectory relative to script
-    ]
-    
-    # Try to find the model file
-    checkpoint_path = None
-    for path in possible_paths:
-        if os.path.isfile(path):
-            checkpoint_path = path
-            break
-    
-    # If model file not found, show error
-    if checkpoint_path is None:
-        st.error(f"Model file '{model_filename}' not found. Please upload the SAM model file.")
-        # Add file uploader for model
-        uploaded_model = st.file_uploader("Upload SAM model file (sam_vit_b_01ec64.pth)", type=["pth"])
-        if uploaded_model is not None:
-            # Save the uploaded model to a temporary file
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.pth') as tmp_file:
-                tmp_file.write(uploaded_model.getvalue())
-                checkpoint_path = tmp_file.name
-        else:
-            st.stop()
-    
-    # Load the model
+
+    # Model configuration
     model_type = "vit_b"
-    sam = sam_model_registry[model_type](checkpoint=checkpoint_path).to(device=device)
-    mask_predictor = SamPredictor(sam)
-    
-    return mask_predictor, device
+    model_filename = "sam_vit_b_01ec64.pth"
+    model_url = "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth"
+
+    # Create a temporary directory for the model
+    model_dir = tempfile.mkdtemp()
+    checkpoint_path = os.path.join(model_dir, model_filename)
+
+    # Download the model if it doesn't exist
+    if not os.path.exists(checkpoint_path):
+        st.info("🔄 Downloading SAM model weights... This may take 2-3 minutes on first run.")
+        st.info("💡 The model will be cached for faster subsequent loads.")
+
+        try:
+            # Download with progress bar
+            response = requests.get(model_url, stream=True, timeout=30)
+            response.raise_for_status()
+
+            total_size = int(response.headers.get('content-length', 0))
+
+            # Create progress bar
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+
+            downloaded = 0
+            with open(checkpoint_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+
+                        # Update progress
+                        if total_size > 0:
+                            progress = downloaded / total_size
+                            progress_bar.progress(progress)
+                            status_text.text(f"Downloaded {downloaded / (1024*1024):.1f} MB / {total_size / (1024*1024):.1f} MB")
+
+            progress_bar.progress(1.0)
+            status_text.text("Download complete! Loading model...")
+
+        except requests.exceptions.RequestException as e:
+            st.error(f"Failed to download model: {str(e)}")
+            st.error("Please check your internet connection and try again.")
+            st.stop()
+        except Exception as e:
+            st.error(f"Error downloading model: {str(e)}")
+            st.stop()
+
+    try:
+        # Load the model
+        sam = sam_model_registry[model_type](checkpoint=checkpoint_path).to(device=device)
+        mask_predictor = SamPredictor(sam)
+
+        # Clean up progress indicators
+        if 'progress_bar' in locals():
+            progress_bar.empty()
+        if 'status_text' in locals():
+            status_text.empty()
+
+        return mask_predictor, device
+
+    except Exception as e:
+        st.error(f"Failed to load model: {str(e)}")
+        st.error("The downloaded model file may be corrupted. Please refresh the page to try again.")
+        # Clean up corrupted file
+        if os.path.exists(checkpoint_path):
+            os.remove(checkpoint_path)
+        st.stop()
+
+# Check for health check endpoint
+if st.query_params.get("health") == "check":
+    st.json({"status": "healthy", "service": "drishya", "model": "SAM"})
+    st.stop()
 
 # App title and description
 st.title("Drishya - Product Image Replacement Tool")
 st.markdown("""
-A tool that lets you replace products in images using AI segmentation. Follow these steps:
-1. Upload an image
+🎯 **AI-powered product replacement** using Meta's Segment Anything Model (SAM)
+
+**How it works:**
+1. Upload an image containing a product
 2. Draw a box around the product to replace
 3. Upload a new product image
 4. Adjust settings and download the result
+
+*First load may take 2-3 minutes while downloading the AI model.*
 """)
 
 # Create session state for storing data between reruns
@@ -545,9 +595,8 @@ st.header("Step 1: Upload Image")
 uploaded_ad_file = st.file_uploader("Upload image with product to replace", type=["jpg", "jpeg", "png"], key="ad_image")
 
 if uploaded_ad_file is not None:
-    # Load the SAM model
-    with st.spinner("Loading AI model..."):
-        mask_predictor, device = load_model()
+    
+    mask_predictor, device = load_model()
     
     # Read the image
     image = Image.open(uploaded_ad_file)
@@ -682,8 +731,7 @@ if uploaded_ad_file is not None:
                 )
                 
                 # Blending options
-                use_blending = st.checkbox("Use Edge Blending", value=True, 
-                                         help="Enable advanced edge blending (uncheck to keep product edges as-is)")
+                use_blending = st.checkbox("Use Edge Blending", value=True, help="Enable advanced edge blending (uncheck to keep product edges as-is)")
                 
                 # Only show feathering slider if blending is enabled
                 feather_amount = 15  # Default value
