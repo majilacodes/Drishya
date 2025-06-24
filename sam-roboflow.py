@@ -25,7 +25,6 @@ def load_model():
     model_url = "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth"
 
     # Use a persistent directory for model storage
-    # This ensures the model is only downloaded once and persists across sessions
     home_dir = os.path.expanduser("~")
     model_dir = os.path.join(home_dir, ".cache", "drishya", "models")
     os.makedirs(model_dir, exist_ok=True)
@@ -33,78 +32,121 @@ def load_model():
 
     # Download the model if it doesn't exist
     if not os.path.exists(checkpoint_path):
-        # Create a placeholder for progress tracking
-        progress_placeholder = st.empty()
-        status_placeholder = st.empty()
-
-        with progress_placeholder.container():
-            st.info("🔄 Downloading SAM model weights... This may take 2-3 minutes on first run.")
-            progress_bar = st.progress(0)
-
-        with status_placeholder.container():
-            status_text = st.empty()
-
         try:
-            # Download with progress bar
-            response = requests.get(model_url, stream=True, timeout=60)
+            # Create progress tracking containers
+            progress_container = st.container()
+            
+            with progress_container:
+                st.info("🔄 Downloading SAM model weights... This may take 2-3 minutes on first run.")
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+
+            # Download with improved error handling
+            response = requests.get(model_url, stream=True, timeout=120)
             response.raise_for_status()
 
             total_size = int(response.headers.get('content-length', 0))
-
             downloaded = 0
-            # Use a temporary file first, then move to final location to avoid partial downloads
+            chunk_size = 8192
+            
+            # Use a temporary file with proper cleanup
             temp_path = checkpoint_path + ".tmp"
 
             try:
                 with open(temp_path, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=8192):
+                    for chunk in response.iter_content(chunk_size=chunk_size):
                         if chunk:
                             f.write(chunk)
                             downloaded += len(chunk)
 
-                            # Update progress
+                            # Update progress with better formatting
                             if total_size > 0:
-                                progress = downloaded / total_size
+                                progress = min(downloaded / total_size, 1.0)
                                 progress_bar.progress(progress)
-                                status_text.text(f"Downloaded {downloaded / (1024*1024):.1f} MB / {total_size / (1024*1024):.1f} MB")
+                                mb_downloaded = downloaded / (1024*1024)
+                                mb_total = total_size / (1024*1024)
+                                status_text.text(f"Downloaded {mb_downloaded:.1f} MB / {mb_total:.1f} MB ({progress*100:.1f}%)")
 
-                # Move temp file to final location only if download completed successfully
+                # Verify file size before moving
+                if total_size > 0 and downloaded < total_size * 0.95:  # Allow 5% tolerance
+                    raise Exception(f"Download incomplete: {downloaded}/{total_size} bytes")
+                
+                # Move temp file to final location
                 os.rename(temp_path, checkpoint_path)
-
+                
+                # Clean up progress indicators
                 progress_bar.progress(1.0)
                 status_text.text("Download complete! Loading model...")
-
+                
             except Exception as e:
-                # Clean up temp file if download failed
+                # Clean up temp file on any error
                 if os.path.exists(temp_path):
-                    os.remove(temp_path)
+                    try:
+                        os.remove(temp_path)
+                    except:
+                        pass
                 raise e
+            finally:
+                # Clear progress indicators after a brief delay
+                import time
+                time.sleep(1)
+                progress_container.empty()
 
+        except requests.exceptions.Timeout:
+            st.error("❌ Download timeout. Please check your internet connection and try again.")
+            st.stop()
+        except requests.exceptions.ConnectionError:
+            st.error("❌ Connection error. Please check your internet connection and try again.")
+            st.stop()
         except requests.exceptions.RequestException as e:
-            st.error(f"Failed to download model: {str(e)}")
-            st.error("Please check your internet connection and try again.")
+            st.error(f"❌ Network error: {str(e)}")
             st.stop()
         except Exception as e:
-            st.error(f"Error downloading model: {str(e)}")
+            st.error(f"❌ Download failed: {str(e)}")
+            # Clean up corrupted file if it exists
+            if os.path.exists(checkpoint_path):
+                try:
+                    os.remove(checkpoint_path)
+                except:
+                    pass
             st.stop()
-        finally:
-            # Clean up progress indicators after download
-            progress_placeholder.empty()
-            status_placeholder.empty()
+
+    # Verify file exists and has reasonable size before loading
+    if not os.path.exists(checkpoint_path):
+        st.error("❌ Model file not found after download.")
+        st.stop()
+    
+    file_size = os.path.getsize(checkpoint_path)
+    expected_min_size = 300 * 1024 * 1024  # 300MB minimum
+    if file_size < expected_min_size:
+        st.error(f"❌ Model file appears corrupted (size: {file_size/(1024*1024):.1f}MB). Please refresh to re-download.")
+        try:
+            os.remove(checkpoint_path)
+        except:
+            pass
+        st.stop()
 
     try:
-        # Load the model
-        sam = sam_model_registry[model_type](checkpoint=checkpoint_path).to(device=device)
+        # Load the model with better error handling
+        sam = sam_model_registry[model_type](checkpoint=checkpoint_path)
+        sam.to(device=device)
         mask_predictor = SamPredictor(sam)
-
+        
+        # Test model loading
+        test_image = np.zeros((100, 100, 3), dtype=np.uint8)
+        mask_predictor.set_image(test_image)
+        
         return mask_predictor, device
 
     except Exception as e:
-        st.error(f"Failed to load model: {str(e)}")
-        st.error("The downloaded model file may be corrupted. Please refresh the page to try again.")
-        # Clean up corrupted file
+        st.error(f"❌ Failed to load model: {str(e)}")
+        st.error("The model file may be corrupted. Please refresh the page to re-download.")
+        # Remove corrupted file
         if os.path.exists(checkpoint_path):
-            os.remove(checkpoint_path)
+            try:
+                os.remove(checkpoint_path)
+            except:
+                pass
         st.stop()
 
 # Set page configuration to wide layout
@@ -152,20 +194,38 @@ def check_password():
 if not check_password():
     st.stop()  # Stop execution if password is incorrect
 
-# Initialize session state for model management
+# Initialize session state for model management with better defaults
 if 'model_loaded' not in st.session_state:
     st.session_state.model_loaded = False
 if 'mask_predictor' not in st.session_state:
     st.session_state.mask_predictor = None
 if 'device' not in st.session_state:
     st.session_state.device = None
+if 'model_load_error' not in st.session_state:
+    st.session_state.model_load_error = None
 
-# Load model immediately after password is correct
-if not st.session_state.model_loaded:
-    with st.spinner("🔄 Loading AI model... This may take 2-3 minutes on first run."):
-        st.session_state.mask_predictor, st.session_state.device = load_model()
-        st.session_state.model_loaded = True
-    st.success("✅ AI model loaded successfully! You can now upload images.")
+# Load model with improved error handling
+if not st.session_state.model_loaded and st.session_state.model_load_error is None:
+    try:
+        with st.spinner("🔄 Loading AI model... This may take 2-3 minutes on first run."):
+            st.session_state.mask_predictor, st.session_state.device = load_model()
+            st.session_state.model_loaded = True
+        st.success("✅ AI model loaded successfully! You can now upload images.")
+    except Exception as e:
+        st.session_state.model_load_error = str(e)
+        st.error(f"❌ Failed to load model: {str(e)}")
+        st.error("Please refresh the page to try again.")
+        st.stop()
+
+# Show error if model failed to load previously
+if st.session_state.model_load_error is not None:
+    st.error(f"❌ Model loading failed: {st.session_state.model_load_error}")
+    if st.button("🔄 Retry Loading Model"):
+        # Reset error state and try again
+        st.session_state.model_load_error = None
+        st.session_state.model_loaded = False
+        st.rerun()
+    st.stop()
 
 # Helper functions
 def show_mask(mask, image):
@@ -341,253 +401,227 @@ def apply_color_grading(product_image, target_image, mask, strength=0.5):
 
 def replace_product_in_image(ad_image, new_product, mask, scale_factor=1.0, feather_amount=15, use_blending=True):
     """
-    Replace a product in an ad image with improved edge blending.
-    
-    Args:
-        ad_image: The original advertisement image (numpy array)
-        new_product: The new product image to insert (numpy array)
-        mask: Binary segmentation mask of the product to replace (numpy array)
-        scale_factor: Controls how much of the mask area the product will fill
-        feather_amount: Amount of edge feathering in pixels
-        use_blending: Whether to apply edge blending or not
-        
-    Returns:
-        The modified image with the new product inserted
+    Replace a product in an ad image with improved edge blending and error handling.
     """
-    # Ensure mask is binary
-    if len(mask.shape) > 2:
-        mask = mask[:, :, 0]
-    binary_mask = (mask > 128).astype(np.uint8)
-    
-    # Get bounding box from mask
-    y_indices, x_indices = np.where(binary_mask == 1)
-    if len(y_indices) == 0 or len(x_indices) == 0:
-        return ad_image
+    try:
+        # Input validation
+        if ad_image is None or new_product is None or mask is None:
+            raise ValueError("Invalid input: image, product, or mask is None")
         
-    y_min, y_max = y_indices.min(), y_indices.max()
-    x_min, x_max = x_indices.min(), x_indices.max()
-    
-    # Calculate dimensions of the mask area
-    mask_height = y_max - y_min + 1
-    mask_width = x_max - x_min + 1
-    
-    # Create output image
-    output = ad_image.copy()
-    
-    # Get product dimensions and aspect ratio
-    prod_height, prod_width = new_product.shape[:2]
-    prod_aspect_ratio = prod_width / prod_height
-    
-    # Calculate the dimensions to preserve aspect ratio
-    base_dimension = min(mask_width, mask_height)
-    scaled_dimension = base_dimension * scale_factor
-    
-    # Calculate new dimensions based on aspect ratio
-    if prod_aspect_ratio > 1.0:
-        # Product is wider than tall
-        resize_width = scaled_dimension * prod_aspect_ratio
-        resize_height = scaled_dimension
-    else:
-        # Product is taller than wide
-        resize_width = scaled_dimension
-        resize_height = scaled_dimension / prod_aspect_ratio
-    
-    # Calculate centering offsets
-    offset_x = int((mask_width - resize_width) / 2)
-    offset_y = int((mask_height - resize_height) / 2)
-    
-    # Create a feathered mask for better edge blending if blending is enabled
-    feathered_mask = binary_mask[y_min:y_max+1, x_min:x_max+1].astype(np.float32)
-    if use_blending:
-        feathered_mask = create_feathered_mask(binary_mask[y_min:y_max+1, x_min:x_max+1], feather_amount)
-    
-    # Handle transparent images (RGBA)
-    if new_product.shape[2] == 4:
-        # Extract alpha channel and RGB channels
-        alpha = new_product[:, :, 3] / 255.0
-        rgb = new_product[:, :, :3]
+        if len(ad_image.shape) != 3 or len(new_product.shape) not in [3, 4]:
+            raise ValueError("Invalid image dimensions")
         
-        # Resize both RGB and alpha to the calculated dimensions
-        resize_width_int = max(1, int(resize_width))
-        resize_height_int = max(1, int(resize_height))
-        resized_rgb = cv2.resize(rgb, (resize_width_int, resize_height_int))
-        resized_alpha = cv2.resize(alpha, (resize_width_int, resize_height_int))
+        # Ensure mask is binary
+        if len(mask.shape) > 2:
+            mask = mask[:, :, 0]
+        binary_mask = (mask > 128).astype(np.uint8)
         
-        # Create a properly sized masks for handling the product overlay
-        product_mask = np.zeros((mask_height, mask_width), dtype=np.float32)
-        
-        # Calculate paste coordinates
-        paste_y_start = offset_y
-        paste_y_end = paste_y_start + resize_height_int
-        paste_x_start = offset_x
-        paste_x_end = paste_x_start + resize_width_int
-        
-        # Calculate corresponding product coordinates
-        prod_y_start = 0
-        prod_y_end = resize_height_int
-        prod_x_start = 0
-        prod_x_end = resize_width_int
-        
-        # Handle overflow
-        if paste_y_start < 0:
-            prod_y_start = -paste_y_start
-            paste_y_start = 0
-        if paste_y_end > mask_height:
-            prod_y_end = resize_height_int - (paste_y_end - mask_height)
-            paste_y_end = mask_height
-        if paste_x_start < 0:
-            prod_x_start = -paste_x_start
-            paste_x_start = 0
-        if paste_x_end > mask_width:
-            prod_x_end = resize_width_int - (paste_x_end - mask_width)
-            paste_x_end = mask_width
-        
-        # Place the resized alpha into the product mask
-        if paste_y_end > paste_y_start and paste_x_end > paste_x_start:
-            prod_y_end = min(prod_y_end, resize_height_int)
-            prod_x_end = min(prod_x_end, resize_width_int)
+        # Get bounding box from mask
+        y_indices, x_indices = np.where(binary_mask == 1)
+        if len(y_indices) == 0 or len(x_indices) == 0:
+            return ad_image
             
-            product_mask[paste_y_start:paste_y_end, paste_x_start:paste_x_end] = resized_alpha[prod_y_start:prod_y_end, prod_x_start:prod_x_end]
+        y_min, y_max = y_indices.min(), y_indices.max()
+        x_min, x_max = x_indices.min(), x_indices.max()
         
-        # Apply the binary mask and then the feathered mask for smooth edges if blending is enabled
-        product_mask = product_mask * feathered_mask
+        # Validate bounding box
+        if y_max <= y_min or x_max <= x_min:
+            return ad_image
         
-        # Create 3-channel alpha for blending
-        product_mask_3ch = np.stack([product_mask, product_mask, product_mask], axis=2)
+        # Calculate dimensions with bounds checking
+        mask_height = min(y_max - y_min + 1, ad_image.shape[0] - y_min)
+        mask_width = min(x_max - x_min + 1, ad_image.shape[1] - x_min)
         
-        # Get the region of interest in the output image
-        roi = output[y_min:y_max+1, x_min:x_max+1]
+        if mask_height <= 0 or mask_width <= 0:
+            return ad_image
         
-        # Create a properly sized RGB image to blend
-        rgb_to_blend = np.zeros((mask_height, mask_width, 3), dtype=np.uint8)
-        if paste_y_end > paste_y_start and paste_x_end > paste_x_start:
-            rgb_to_blend[paste_y_start:paste_y_end, paste_x_start:paste_x_end] = resized_rgb[prod_y_start:prod_y_end, prod_x_start:prod_x_end]
+        # Create output image
+        output = ad_image.copy()
         
-        # Basic alpha blending
-        blended_roi = roi * (1 - product_mask_3ch) + rgb_to_blend * product_mask_3ch
+        # Get product dimensions and aspect ratio with validation
+        prod_height, prod_width = new_product.shape[:2]
+        if prod_height <= 0 or prod_width <= 0:
+            return ad_image
+            
+        prod_aspect_ratio = prod_width / prod_height
         
+        # Calculate the dimensions to preserve aspect ratio
+        base_dimension = min(mask_width, mask_height)
+        scaled_dimension = max(1, base_dimension * scale_factor)
+        
+        # Calculate new dimensions based on aspect ratio
+        if prod_aspect_ratio > 1.0:
+            resize_width = scaled_dimension * prod_aspect_ratio
+            resize_height = scaled_dimension
+        else:
+            resize_width = scaled_dimension
+            resize_height = scaled_dimension / prod_aspect_ratio
+        
+        # Ensure minimum dimensions
+        resize_width = max(1, int(resize_width))
+        resize_height = max(1, int(resize_height))
+        
+        # Calculate centering offsets
+        offset_x = int((mask_width - resize_width) / 2)
+        offset_y = int((mask_height - resize_height) / 2)
+        
+        # Create a feathered mask for better edge blending
+        mask_roi = binary_mask[y_min:y_max+1, x_min:x_max+1].astype(np.float32)
+        feathered_mask = mask_roi
         if use_blending:
-            # Edge detection on the original mask to identify boundary regions
-            edge_kernel = np.ones((5, 5), np.uint8)
-            edge_mask = cv2.dilate(binary_mask[y_min:y_max+1, x_min:x_max+1], edge_kernel) - binary_mask[y_min:y_max+1, x_min:x_max+1]
-            edge_mask = np.clip(edge_mask, 0, 1).astype(np.float32)
+            feathered_mask = create_feathered_mask(mask_roi, feather_amount)
+        
+        # Handle transparent images (RGBA) vs RGB
+        if new_product.shape[2] == 4:
+            # RGBA handling with improved error checking
+            alpha = new_product[:, :, 3] / 255.0
+            rgb = new_product[:, :, :3]
             
-            # Apply guided filtering for improved edge transitions
-            try:
-                r = 5  # Filter radius
-                eps = 0.1  # Regularization parameter
-                
-                harmonized_blend = blended_roi.copy()
-                for c in range(3):
-                    harmonized_blend[:,:,c] = cv2.guidedFilter(
-                        roi[:,:,c].astype(np.float32), 
-                        blended_roi[:,:,c].astype(np.float32),
-                        r, eps
-                    )
-                
-                blended_roi = harmonized_blend.astype(np.uint8)
-            except:
-                # Fallback to simple blurring at the edges
-                blur_amount = 3
-                edge_blur = cv2.GaussianBlur(edge_mask, (blur_amount*2+1, blur_amount*2+1), 0) * 0.7
-                edge_blur_3ch = np.stack([edge_blur, edge_blur, edge_blur], axis=2)
-                
-                harmonized_blend = blended_roi * (1 - edge_blur_3ch) + cv2.GaussianBlur(blended_roi, (blur_amount*2+1, blur_amount*2+1), 0) * edge_blur_3ch
-                blended_roi = harmonized_blend.astype(np.uint8)
-        
-        # Place the blended region back into the output image
-        output[y_min:y_max+1, x_min:x_max+1] = blended_roi
-    else:
-        # For non-transparent images - similar approach
-        # Resize the product image
-        resize_width_int = max(1, int(resize_width))
-        resize_height_int = max(1, int(resize_height))
-        resized_product = cv2.resize(new_product, (resize_width_int, resize_height_int))
-        
-        # Create a properly sized product image to blend
-        product_to_blend = np.zeros((mask_height, mask_width, 3), dtype=np.uint8)
-        
-        # Calculate paste coordinates
-        paste_y_start = offset_y
-        paste_y_end = paste_y_start + resize_height_int
-        paste_x_start = offset_x
-        paste_x_end = paste_x_start + resize_width_int
-        
-        # Calculate corresponding product coordinates
-        prod_y_start = 0
-        prod_y_end = resize_height_int
-        prod_x_start = 0
-        prod_x_end = resize_width_int
-        
-        # Handle overflow
-        if paste_y_start < 0:
-            prod_y_start = -paste_y_start
-            paste_y_start = 0
-        if paste_y_end > mask_height:
-            prod_y_end = resize_height_int - (paste_y_end - mask_height)
-            paste_y_end = mask_height
-        if paste_x_start < 0:
-            prod_x_start = -paste_x_start
-            paste_x_start = 0
-        if paste_x_end > mask_width:
-            prod_x_end = resize_width_int - (paste_x_end - mask_width)
-            paste_x_end = mask_width
-        
-        # Place the resized product into the blend image
-        if paste_y_end > paste_y_start and paste_x_end > paste_x_start:
-            prod_y_end = min(prod_y_end, resize_height_int)
-            prod_x_end = min(prod_x_end, resize_width_int)
+            # Resize with proper interpolation
+            resized_rgb = cv2.resize(rgb, (resize_width, resize_height), interpolation=cv2.INTER_LANCZOS4)
+            resized_alpha = cv2.resize(alpha, (resize_width, resize_height), interpolation=cv2.INTER_LANCZOS4)
             
-            product_to_blend[paste_y_start:paste_y_end, paste_x_start:paste_x_end] = resized_product[prod_y_start:prod_y_end, prod_x_start:prod_x_end]
+            # Create product mask with bounds checking
+            product_mask = np.zeros((mask_height, mask_width), dtype=np.float32)
+            
+            # Calculate safe paste coordinates
+            paste_y_start = max(0, offset_y)
+            paste_y_end = min(mask_height, offset_y + resize_height)
+            paste_x_start = max(0, offset_x)
+            paste_x_end = min(mask_width, offset_x + resize_width)
+            
+            # Calculate corresponding product coordinates
+            prod_y_start = max(0, -offset_y)
+            prod_y_end = min(resize_height, prod_y_start + (paste_y_end - paste_y_start))
+            prod_x_start = max(0, -offset_x)
+            prod_x_end = min(resize_width, prod_x_start + (paste_x_end - paste_x_start))
+            
+            # Place the resized alpha with bounds checking
+            if (paste_y_end > paste_y_start and paste_x_end > paste_x_start and 
+                prod_y_end > prod_y_start and prod_x_end > prod_x_start):
+                
+                try:
+                    product_mask[paste_y_start:paste_y_end, paste_x_start:paste_x_end] = \
+                        resized_alpha[prod_y_start:prod_y_end, prod_x_start:prod_x_end]
+                except ValueError:
+                    # Fallback: center the product
+                    center_y = mask_height // 2
+                    center_x = mask_width // 2
+                    half_h = resize_height // 2
+                    half_w = resize_width // 2
+                    
+                    y_start = max(0, center_y - half_h)
+                    y_end = min(mask_height, center_y + half_h)
+                    x_start = max(0, center_x - half_w)
+                    x_end = min(mask_width, center_x + half_w)
+                    
+                    product_mask[y_start:y_end, x_start:x_end] = 1.0
+            
+            # Apply feathered mask
+            product_mask = product_mask * feathered_mask
+            product_mask_3ch = np.stack([product_mask, product_mask, product_mask], axis=2)
+            
+            # Get ROI and create RGB blend image
+            roi = output[y_min:y_max+1, x_min:x_max+1]
+            rgb_to_blend = np.zeros((mask_height, mask_width, 3), dtype=np.uint8)
+            
+            if (paste_y_end > paste_y_start and paste_x_end > paste_x_start and 
+                prod_y_end > prod_y_start and prod_x_end > prod_x_start):
+                try:
+                    rgb_to_blend[paste_y_start:paste_y_end, paste_x_start:paste_x_end] = \
+                        resized_rgb[prod_y_start:prod_y_end, prod_x_start:prod_x_end]
+                except ValueError:
+                    pass  # Skip if dimensions don't match
+            
+            # Perform blending
+            blended_roi = roi * (1 - product_mask_3ch) + rgb_to_blend * product_mask_3ch
+            
+        else:
+            # RGB handling (similar improvements)
+            resized_product = cv2.resize(new_product, (resize_width, resize_height), interpolation=cv2.INTER_LANCZOS4)
+            
+            product_to_blend = np.zeros((mask_height, mask_width, 3), dtype=np.uint8)
+            
+            # Safe coordinate calculation (same as above)
+            paste_y_start = max(0, offset_y)
+            paste_y_end = min(mask_height, offset_y + resize_height)
+            paste_x_start = max(0, offset_x)
+            paste_x_end = min(mask_width, offset_x + resize_width)
+            
+            prod_y_start = max(0, -offset_y)
+            prod_y_end = min(resize_height, prod_y_start + (paste_y_end - paste_y_start))
+            prod_x_start = max(0, -offset_x)
+            prod_x_end = min(resize_width, prod_x_start + (paste_x_end - paste_x_start))
+            
+            if (paste_y_end > paste_y_start and paste_x_end > paste_x_start and 
+                prod_y_end > prod_y_start and prod_x_end > prod_x_start):
+                try:
+                    product_to_blend[paste_y_start:paste_y_end, paste_x_start:paste_x_end] = \
+                        resized_product[prod_y_start:prod_y_end, prod_x_start:prod_x_end]
+                except ValueError:
+                    pass
+            
+            # Create product mask
+            product_mask = np.zeros((mask_height, mask_width), dtype=np.float32)
+            if (paste_y_end > paste_y_start and paste_x_end > paste_x_start):
+                product_mask[paste_y_start:paste_y_end, paste_x_start:paste_x_end] = 1
+            
+            product_mask = product_mask * feathered_mask
+            product_mask_3ch = np.stack([product_mask, product_mask, product_mask], axis=2)
+            
+            roi = output[y_min:y_max+1, x_min:x_max+1]
+            blended_roi = roi * (1 - product_mask_3ch) + product_to_blend * product_mask_3ch
         
-        # Apply the feathered mask for smooth edges
-        product_mask = np.zeros((mask_height, mask_width), dtype=np.float32)
-        if paste_y_end > paste_y_start and paste_x_end > paste_x_start:
-            product_mask[paste_y_start:paste_y_end, paste_x_start:paste_x_end] = 1
-        
-        # Combine with feathered mask
-        product_mask = product_mask * feathered_mask
-        product_mask_3ch = np.stack([product_mask, product_mask, product_mask], axis=2)
-        
-        # Get the region of interest
-        roi = output[y_min:y_max+1, x_min:x_max+1]
-        
-        # Basic alpha blending
-        blended_roi = roi * (1 - product_mask_3ch) + product_to_blend * product_mask_3ch
-        
+        # Apply edge blending if enabled
         if use_blending:
-            # Edge detection to identify boundary regions
-            edge_kernel = np.ones((5, 5), np.uint8)
-            edge_mask = cv2.dilate(binary_mask[y_min:y_max+1, x_min:x_max+1], edge_kernel) - binary_mask[y_min:y_max+1, x_min:x_max+1]
-            edge_mask = np.clip(edge_mask, 0, 1).astype(np.float32)
-            
-            # Apply guided filtering for improved edge transitions
             try:
-                r = 5  # Filter radius
-                eps = 0.1  # Regularization parameter
+                edge_kernel = np.ones((5, 5), np.uint8)
+                edge_mask = cv2.dilate(mask_roi.astype(np.uint8), edge_kernel) - mask_roi.astype(np.uint8)
+                edge_mask = np.clip(edge_mask, 0, 1).astype(np.float32)
                 
-                harmonized_blend = blended_roi.copy()
-                for c in range(3):
-                    harmonized_blend[:,:,c] = cv2.guidedFilter(
-                        roi[:,:,c].astype(np.float32), 
-                        blended_roi[:,:,c].astype(np.float32),
-                        r, eps
-                    )
-                
-                blended_roi = harmonized_blend.astype(np.uint8)
+                # Apply guided filtering with fallback to Gaussian blur
+                try:
+                    r = 5
+                    eps = 0.1
+                    harmonized_blend = blended_roi.copy()
+                    for c in range(3):
+                        harmonized_blend[:,:,c] = cv2.guidedFilter(
+                            roi[:,:,c].astype(np.float32), 
+                            blended_roi[:,:,c].astype(np.float32),
+                            r, eps
+                        )
+                    blended_roi = harmonized_blend.astype(np.uint8)
+                except:
+                    # Fallback to Gaussian blur
+                    blur_amount = 3
+                    edge_blur = cv2.GaussianBlur(edge_mask, (blur_amount*2+1, blur_amount*2+1), 0) * 0.7
+                    edge_blur_3ch = np.stack([edge_blur, edge_blur, edge_blur], axis=2)
+                    harmonized_blend = blended_roi * (1 - edge_blur_3ch) + cv2.GaussianBlur(blended_roi, (blur_amount*2+1, blur_amount*2+1), 0) * edge_blur_3ch
+                    blended_roi = harmonized_blend.astype(np.uint8)
             except:
-                # Fallback to simple blurring at the edges
-                blur_amount = 3
-                edge_blur = cv2.GaussianBlur(edge_mask, (blur_amount*2+1, blur_amount*2+1), 0) * 0.7
-                edge_blur_3ch = np.stack([edge_blur, edge_blur, edge_blur], axis=2)
-                
-                harmonized_blend = blended_roi * (1 - edge_blur_3ch) + cv2.GaussianBlur(blended_roi, (blur_amount*2+1, blur_amount*2+1), 0) * edge_blur_3ch
-                blended_roi = harmonized_blend.astype(np.uint8)
+                pass  # Use basic blending if edge processing fails
         
-        # Place the blended region back into the output image
-        output[y_min:y_max+1, x_min:x_max+1] = blended_roi
-    
-    return output
+        # Place the blended region back with bounds checking
+        try:
+            output[y_min:y_max+1, x_min:x_max+1] = blended_roi
+        except ValueError:
+            # Fallback: try to place what fits
+            out_h, out_w = output.shape[:2]
+            roi_h, roi_w = blended_roi.shape[:2]
+            
+            actual_y_end = min(y_min + roi_h, out_h)
+            actual_x_end = min(x_min + roi_w, out_w)
+            actual_roi_h = actual_y_end - y_min
+            actual_roi_w = actual_x_end - x_min
+            
+            if actual_roi_h > 0 and actual_roi_w > 0:
+                output[y_min:actual_y_end, x_min:actual_x_end] = blended_roi[:actual_roi_h, :actual_roi_w]
+        
+        return output
+        
+    except Exception as e:
+        st.error(f"Error during image processing: {str(e)}")
+        return ad_image  # Return original image on error
 
 
 
@@ -605,7 +639,7 @@ if st.query_params.get("health") == "check":
 # App title and description
 st.title("Drishya - Product Image Replacement Tool")
 st.markdown("""
-🎯 **AI-powered product replacement** using Meta's Segment Anything Model (SAM)
+**AI-powered product replacement** using Meta's Segment Anything Model (SAM)
 
 **How it works:**
 1. Upload an image containing a product
@@ -706,27 +740,44 @@ if uploaded_ad_file is not None:
             
             with col2:
                 if st.button("Generate Mask", key="generate_mask"):
-                    with st.spinner("Processing image"):
-                        # Set the image for the predictor
-                        mask_predictor.set_image(image_rgb)
-                        
-                        # Generate masks
-                        masks, scores, logits = mask_predictor.predict(
-                            box=np.array([x_min, y_min, x_max, y_max]),
-                            multimask_output=True
-                        )
-                        
-                        # Get best mask by score
-                        best_mask_idx = np.argmax(scores)
-                        binary_mask = masks[best_mask_idx].astype(np.uint8) * 255
-                        
-                        # Save to session state
-                        st.session_state.generated_mask = binary_mask
-                        st.session_state.mask_displayed = True
-                        st.session_state.processing_step = 3  # Advance to next step
-                        
-                        # Force re-run to update the UI
-                        st.rerun()
+                    try:
+                        with st.spinner("Processing image"):
+                            # Validate coordinates
+                            if x_min >= x_max or y_min >= y_max:
+                                st.error("Invalid bounding box. Please draw a proper rectangle.")
+                                st.stop()
+                            
+                            # Set the image for the predictor
+                            mask_predictor.set_image(image_rgb)
+                            
+                            # Generate masks with error handling
+                            masks, scores, logits = mask_predictor.predict(
+                                box=np.array([x_min, y_min, x_max, y_max]),
+                                multimask_output=True
+                            )
+                            
+                            if len(masks) == 0:
+                                st.error("Failed to generate mask. Please try a different bounding box.")
+                                st.stop()
+                            
+                            # Get best mask by score
+                            best_mask_idx = np.argmax(scores)
+                            binary_mask = masks[best_mask_idx].astype(np.uint8) * 255
+                            
+                            # Validate mask
+                            if np.sum(binary_mask) == 0:
+                                st.error("Generated mask is empty. Please try a different bounding box.")
+                                st.stop()
+                            
+                            # Save to session state
+                            st.session_state.generated_mask = binary_mask
+                            st.session_state.mask_displayed = True
+                            st.session_state.processing_step = 3
+                            
+                            st.rerun()
+                    except Exception as e:
+                        st.error(f"Error generating mask: {str(e)}")
+                        st.error("Please try with different settings or images.")
 
     # Step 3: Show mask and allow product upload
     if st.session_state.mask_displayed and st.session_state.generated_mask is not None:
@@ -825,77 +876,91 @@ if uploaded_ad_file is not None:
             
             # Replace button
             if st.button("Replace Product"):
-                with st.spinner("Replacing product..."):
-                    # Use the original image (already in RGB format)
-                    original_img = st.session_state.original_image.copy()
+                try:
+                    with st.spinner("Replacing product..."):
+                        # Validate inputs
+                        if st.session_state.original_image is None:
+                            st.error("Original image not found. Please reload the page.")
+                            st.stop()
+                        
+                        if st.session_state.generated_mask is None:
+                            st.error("Mask not found. Please generate a mask first.")
+                            st.stop()
+                        
+                        # Use the original image
+                        original_img = st.session_state.original_image.copy()
 
-                    # Ensure new product is in the correct format
-                    if len(new_product_np.shape) == 2:  # Grayscale
-                        new_product_np = cv2.cvtColor(new_product_np, cv2.COLOR_GRAY2RGB)
-                    # new_product_np is already handled above for RGBA/RGB formats
-                    
-                    # Apply color grading if enabled
-                    graded_product = new_product_np.copy()
-                    if enable_color_grading:
-                        if grading_method == "Match Target Area":
-                            # Use the mask area for color matching
-                            graded_product = apply_color_grading(
-                                new_product_np, 
-                                original_img, 
-                                st.session_state.generated_mask, 
-                                color_grade_strength
+                        # Ensure new product is in the correct format
+                        if len(new_product_np.shape) == 2:  # Grayscale
+                            new_product_np = cv2.cvtColor(new_product_np, cv2.COLOR_GRAY2RGB)
+                        
+                        # Apply color grading if enabled
+                        graded_product = new_product_np.copy()
+                        if enable_color_grading:
+                            try:
+                                if grading_method == "Match Target Area":
+                                    graded_product = apply_color_grading(
+                                        new_product_np, 
+                                        original_img, 
+                                        st.session_state.generated_mask, 
+                                        color_grade_strength
+                                    )
+                                else:
+                                    full_mask = np.ones(original_img.shape[:2], dtype=np.uint8) * 255
+                                    graded_product = apply_color_grading(
+                                        new_product_np,
+                                        original_img,
+                                        full_mask,
+                                        color_grade_strength
+                                    )
+                            except Exception as e:
+                                st.warning(f"Color grading failed: {str(e)}. Using original product colors.")
+                        
+                        # Replace the product
+                        result_image = replace_product_in_image(
+                            original_img,
+                            graded_product,
+                            st.session_state.generated_mask,
+                            scale_factor,
+                            feather_amount,
+                            use_blending
+                        )
+                        
+                        # Display results
+                        st.header("Results")
+                        col1, col2 = st.columns(2)
+
+                        with col1:
+                            st.markdown("**Original Image**")
+                            display_original = np.clip(original_img, 0, 255).astype(np.uint8)
+                            st.image(display_original, use_column_width=True)
+
+                        with col2:
+                            st.markdown("**Replaced Product**")
+                            display_result = np.clip(result_image, 0, 255).astype(np.uint8)
+                            st.image(display_result, use_column_width=True)
+                        
+                        # Create download with error handling
+                        try:
+                            display_result = np.clip(result_image, 0, 255).astype(np.uint8)
+                            result_pil = Image.fromarray(display_result)
+
+                            img_buffer = BytesIO()
+                            result_pil.save(img_buffer, format='PNG', optimize=True)
+                            img_buffer.seek(0)
+
+                            st.download_button(
+                                label="Download Final Image",
+                                data=img_buffer.getvalue(),
+                                file_name="product_replaced_image.png",
+                                mime="image/png"
                             )
-                        else:  # Match Entire Image
-                            # Create a full-image mask for color matching with the entire image
-                            full_mask = np.ones(original_img.shape[:2], dtype=np.uint8) * 255
-                            graded_product = apply_color_grading(
-                                new_product_np,
-                                original_img,
-                                full_mask,
-                                color_grade_strength
-                            )
-                    
-                    # Replace the product with improved edge blending
-                    result_image = replace_product_in_image(
-                        original_img,
-                        graded_product,
-                        st.session_state.generated_mask,
-                        scale_factor,
-                        feather_amount,
-                        use_blending
-                    )
-                    
-                    # Display the results side by side
-                    st.header("Results")
-                    col1, col2 = st.columns(2)
-
-                    with col1:
-                        st.markdown("**Original Image**")
-                        # Ensure image is in correct format for display
-                        display_original = np.clip(original_img, 0, 255).astype(np.uint8)
-                        st.image(display_original, use_column_width=True)
-
-                    with col2:
-                        st.markdown("**Replaced Product**")
-                        # Ensure result image is in correct format for display
-                        display_result = np.clip(result_image, 0, 255).astype(np.uint8)
-                        st.image(display_result, use_column_width=True)
-                    
-                    # Save the result to a temporary file for download
-                    display_result = np.clip(result_image, 0, 255).astype(np.uint8)
-                    result_pil = Image.fromarray(display_result)
-
-                    # Create a BytesIO buffer for the download
-                    img_buffer = BytesIO()
-                    result_pil.save(img_buffer, format='PNG')
-                    img_buffer.seek(0)
-
-                    st.download_button(
-                        label="Download Final Image",
-                        data=img_buffer.getvalue(),
-                        file_name="product_replaced_image.png",
-                        mime="image/png"
-                    )
+                        except Exception as e:
+                            st.error(f"Failed to prepare download: {str(e)}")
+                            
+                except Exception as e:
+                    st.error(f"Failed to replace product: {str(e)}")
+                    st.error("Please try with different settings or images.")
 
 # Add footer
 st.markdown("---")
